@@ -1,9 +1,12 @@
+import os
 import streamlit as st
 import pandas as pd
 from datetime import date
 import plotly.express as px
+from sqlalchemy import text
+from streamlit_cookies_manager import EncryptedCookieManager
 
-from database import init_db, get_connection
+from database import init_db, engine
 from analytics import (
     load_transactions,
     load_snapshots,
@@ -16,12 +19,55 @@ from analytics import (
     set_setting
 )
 
-# ---------------- SETUP ----------------
+# ---------------- INIT DB ----------------
 init_db()
+
+# ---------------- STREAMLIT CONFIG ----------------
 st.set_page_config(page_title="NetWorth Tracker", layout="wide")
 
-st.title("💰 NetWorth Tracker ")
+# ---------------- COOKIES (PERSISTENT LOGIN) ----------------
+cookies = EncryptedCookieManager(
+    prefix="networth_app",
+    password=os.getenv("APP_PASSWORD", "default_secret")
+)
 
+if not cookies.ready():
+    st.stop()
+
+# ---------------- PASSWORD PROTECTION ----------------
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+if APP_PASSWORD == "":
+    st.session_state.authenticated = True
+else:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    # Auto login from cookie
+    if cookies.get("auth") == "true":
+        st.session_state.authenticated = True
+
+    if not st.session_state.authenticated:
+        st.title("🔒 Protected NetWorth Tracker")
+
+        password_input = st.text_input("Enter password", type="password")
+
+        if st.button("Login"):
+            if password_input == APP_PASSWORD:
+                st.session_state.authenticated = True
+                cookies["auth"] = "true"
+                cookies.save()
+                st.success("Welcome Sir 😈")
+                st.rerun()
+            else:
+                st.error("Wrong password.")
+
+        st.stop()
+
+# ---------------- TITLE ----------------
+st.title("💰 NetWorth Tracker (1 Capital Account)")
+
+# ---------------- SIDEBAR MENU ----------------
 menu = st.sidebar.radio("📌 Menu", [
     "Dashboard",
     "Transactions",
@@ -29,6 +75,13 @@ menu = st.sidebar.radio("📌 Menu", [
     "Export",
     "Settings"
 ])
+
+# Logout
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.authenticated = False
+    cookies["auth"] = "false"
+    cookies.save()
+    st.rerun()
 
 # Always save snapshot for today
 save_snapshot()
@@ -40,16 +93,16 @@ month_names = {
     9: "September", 10: "October", 11: "November", 12: "December"
 }
 
+
 # ---------------- DASHBOARD ----------------
 if menu == "Dashboard":
     st.subheader("📊 Dashboard")
 
     transactions_df = load_transactions()
+    starting_balance = float(get_setting("starting_balance") or 0)
 
     # ---------------- NET WORTH LIVE ----------------
     st.subheader("💎 Net Worth (Live)")
-
-    starting_balance = float(get_setting("starting_balance") or 0)
 
     if not transactions_df.empty:
         total_income_all = transactions_df[transactions_df["type"] == "income"]["amount"].sum()
@@ -67,6 +120,7 @@ if menu == "Dashboard":
 
     st.divider()
 
+    # ---------------- NET WORTH CURVE ----------------
     st.subheader("📉 Net Worth Curve (Daily)")
 
     timeline_df = build_balance_timeline()
@@ -92,31 +146,10 @@ if menu == "Dashboard":
 
     st.divider()
 
-    # ---------------- THIS MONTH KPI ----------------
-    st.subheader("📌 This Month Overview")
-
-    today = date.today()
-    current_month = today.strftime("%Y-%m")
-
-    if not transactions_df.empty:
-        df_temp = transactions_df.copy()
-        df_temp["date"] = pd.to_datetime(df_temp["date"])
-        df_temp["month"] = df_temp["date"].dt.to_period("M").astype(str)
-
-        expenses_month = df_temp[(df_temp["type"] == "expense") & (df_temp["month"] == current_month)]["amount"].sum()
-        income_month = df_temp[(df_temp["type"] == "income") & (df_temp["month"] == current_month)]["amount"].sum()
-    else:
-        expenses_month = 0
-        income_month = 0
-
-    col1, col2 = st.columns(2)
-    col1.metric("📉 Expenses (This Month)", f"{expenses_month:,.2f} €")
-    col2.metric("📈 Income (This Month)", f"{income_month:,.2f} €")
-
-    st.divider()
-
     # ---------------- MONTH NAVIGATION ----------------
     st.subheader("📅 Month Navigation")
+
+    today = date.today()
 
     if "selected_year" not in st.session_state:
         st.session_state.selected_year = today.year
@@ -175,17 +208,17 @@ if menu == "Dashboard":
     st.subheader("📌 Display Mode")
 
     display_mode = st.radio(
-    "Choose display mode:",
-    ["Daily (Normal)", "Cumulative (Month)", "Cumulative (Year)"],
-    index=1,
-    horizontal=True
-)
+        "Choose display mode:",
+        ["Daily (Normal)", "Cumulative (Month)", "Cumulative (Year)"],
+        index=1,
+        horizontal=True
+    )
 
     show_balance = st.checkbox("Show balance curve (Net Worth)", value=False)
 
     st.divider()
 
-    # ---------------- PREPARE TRANSACTIONS DF ----------------
+    # ---------------- PREPARE DF ----------------
     if not transactions_df.empty:
         df_all = transactions_df.copy()
         df_all["date"] = pd.to_datetime(df_all["date"]).dt.date
@@ -214,20 +247,22 @@ if menu == "Dashboard":
     if not df_all.empty:
         daily_summary = df_period.groupby(["date", "type"])["amount"].sum().reset_index()
 
-        income_daily = daily_summary[daily_summary["type"] == "income"].rename(columns={"amount": "income"})
-        expense_daily = daily_summary[daily_summary["type"] == "expense"].rename(columns={"amount": "expense"})
+        pivot = daily_summary.pivot(index="date", columns="type", values="amount").fillna(0)
 
-        merged = pd.merge(
-            income_daily[["date", "income"]],
-            expense_daily[["date", "expense"]],
-            on="date",
-            how="outer"
-        ).fillna(0)
+        if "income" not in pivot.columns:
+            pivot["income"] = 0
 
-        merged = merged.sort_values("date")
+        if "expense" not in pivot.columns:
+            pivot["expense"] = 0
+
+        pivot = pivot.sort_index()
+
+        merged = pivot.reset_index()[["date", "income", "expense"]]
 
         # Fill missing days
         all_days = pd.date_range(start=start_date, end=end_date - pd.Timedelta(days=1), freq="D").date
+        merged["date"] = pd.to_datetime(merged["date"]).dt.date
+
         merged = merged.set_index("date").reindex(all_days, fill_value=0).reset_index()
         merged = merged.rename(columns={"index": "date"})
 
@@ -236,12 +271,12 @@ if menu == "Dashboard":
             merged["income"] = merged["income"].cumsum()
             merged["expense"] = merged["expense"].cumsum()
 
-        # Add balance if requested
+        # Add balance curve if requested
         if show_balance:
-            timeline_df = build_balance_timeline()
-            timeline_df["date"] = pd.to_datetime(timeline_df["date"]).dt.date
+            timeline_df2 = build_balance_timeline()
+            timeline_df2["date"] = pd.to_datetime(timeline_df2["date"]).dt.date
 
-            merged = pd.merge(merged, timeline_df, on="date", how="left")
+            merged = pd.merge(merged, timeline_df2, on="date", how="left")
             merged["balance"] = merged["balance"].fillna(method="ffill").fillna(0)
 
         # Title
@@ -250,7 +285,6 @@ if menu == "Dashboard":
         else:
             title = f"{display_mode} - {month_names[selected_month]} {selected_year}"
 
-        # Select Y columns
         y_cols = ["income", "expense"]
         if show_balance:
             y_cols.append("balance")
@@ -270,10 +304,9 @@ if menu == "Dashboard":
             legend_title="Metrics"
         )
 
-        # Colors (income green apple, expense red, balance grey)
         for trace in fig.data:
             if trace.name == "income":
-                trace.line.color = "#7CFC00"  # apple green
+                trace.line.color = "#7CFC00"
             elif trace.name == "expense":
                 trace.line.color = "red"
             elif trace.name == "balance":
@@ -314,7 +347,7 @@ if menu == "Dashboard":
                 cat,
                 names="category",
                 values="amount",
-                title=f"Expenses by Category ({month_names[selected_month]} {selected_year})"
+                title=f"Expenses ({month_names[selected_month]} {selected_year})"
             )
 
             st.plotly_chart(fig_pie, use_container_width=True)
@@ -341,6 +374,7 @@ if menu == "Dashboard":
             )
             st.plotly_chart(fig_monthly, use_container_width=True)
 
+
 # ---------------- TRANSACTIONS ----------------
 elif menu == "Transactions":
     st.subheader("🧾 Transactions")
@@ -351,7 +385,7 @@ elif menu == "Transactions":
         t_date = st.date_input("Date", value=date.today())
         t_type = st.selectbox("Type", ["expense", "income"])
 
-        category_list = ["rent", "elec", "agua", "wifi", "food, gas, outfit", "other"]
+        category_list = ["rent", "elec", "agua", "wifi", "food", "gas", "outfit", "other"]
         t_category = st.selectbox("Category", category_list)
 
         if t_category == "other":
@@ -365,22 +399,25 @@ elif menu == "Transactions":
         submitted = st.form_submit_button("➕ Add Transaction")
 
         if submitted:
-            conn = get_connection()
-            cursor = conn.cursor()
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                    INSERT INTO transactions (date, type, category, amount, note)
+                    VALUES (:date, :type, :category, :amount, :note)
+                    """),
+                    {
+                        "date": str(t_date),
+                        "type": t_type,
+                        "category": t_category,
+                        "amount": float(t_amount),
+                        "note": t_note
+                    }
+                )
 
-            cursor.execute("""
-            INSERT INTO transactions (date, type, category, amount, note)
-            VALUES (?, ?, ?, ?, ?)
-            """, (str(t_date), t_type, t_category, t_amount, t_note))
-
-            conn.commit()
-            conn.close()
-
-            # Update balance
             if t_type == "expense":
-                balance -= t_amount
+                balance -= float(t_amount)
             else:
-                balance += t_amount
+                balance += float(t_amount)
 
             set_balance(balance)
             save_snapshot()
@@ -397,55 +434,84 @@ elif menu == "Transactions":
     else:
         st.dataframe(df, use_container_width=True)
 
+        st.divider()
+
         st.subheader("🗑️ Delete Transaction (Auto reverse impact)")
 
         selected_id = st.selectbox("Select Transaction ID", df["id"].tolist())
 
         if st.button("Delete selected transaction"):
-            conn = get_connection()
-            cursor = conn.cursor()
+            with engine.begin() as conn:
+                row = conn.execute(
+                    text("SELECT type, amount FROM transactions WHERE id=:id"),
+                    {"id": int(selected_id)}
+                ).fetchone()
 
-            cursor.execute("SELECT type, amount FROM transactions WHERE id=?", (selected_id,))
-            row = cursor.fetchone()
+                if row:
+                    t_type = row[0]
+                    t_amount = float(row[1])
 
-            if row:
-                t_type, t_amount = row
+                    current_balance = get_balance()
 
-                current_balance = get_balance()
+                    if t_type == "expense":
+                        current_balance += t_amount
+                    else:
+                        current_balance -= t_amount
 
-                # Reverse effect
-                if t_type == "expense":
-                    current_balance += t_amount
-                else:
-                    current_balance -= t_amount
+                    set_balance(current_balance)
 
-                set_balance(current_balance)
+                    conn.execute(
+                        text("DELETE FROM transactions WHERE id=:id"),
+                        {"id": int(selected_id)}
+                    )
 
-                cursor.execute("DELETE FROM transactions WHERE id=?", (selected_id,))
-                conn.commit()
-
-            conn.close()
             save_snapshot()
-
             st.success("Transaction deleted and balance corrected.")
             st.rerun()
+
 
 # ---------------- TIMELINE ----------------
 elif menu == "Timeline":
     st.subheader("📈 Net Worth Evolution (Transaction-Based)")
+
+    starting_balance = float(get_setting("starting_balance") or 0)
+    starting_date_str = get_setting("starting_date") or str(date.today())
+
+    colA, colB = st.columns(2)
+    colA.metric("📌 Current Starting Balance", f"{starting_balance:,.2f} €")
+    colB.metric("📅 Current Starting Date", starting_date_str)
+
+    st.divider()
+
+    st.subheader("⚙️ Edit Timeline Starting Point")
+
+    with st.form("update_timeline_settings"):
+        new_starting_balance = st.number_input(
+            "Starting Balance (€)",
+            value=float(starting_balance),
+            step=100.0
+        )
+
+        new_starting_date = st.date_input(
+            "Starting Date",
+            value=pd.to_datetime(starting_date_str)
+        )
+
+        submitted = st.form_submit_button("💾 Save Starting Point")
+
+        if submitted:
+            set_setting("starting_balance", str(new_starting_balance))
+            set_setting("starting_date", str(new_starting_date))
+            st.success("Starting point updated successfully!")
+            st.rerun()
+
+    st.divider()
 
     timeline_df = build_balance_timeline()
 
     if timeline_df.empty:
         st.info("No timeline data available yet.")
     else:
-        col1, col2 = st.columns(2)
-
-        col1.metric("📌 Starting Balance", f"{float(get_setting('starting_balance') or 0):,.2f} €")
-        col2.metric("📅 Starting Date", str(get_setting("starting_date")))
-
-        st.divider()
-
         fig = px.line(
             timeline_df,
             x="date",
@@ -466,6 +532,7 @@ elif menu == "Timeline":
 
         st.subheader("📋 Timeline Data")
         st.dataframe(timeline_df, use_container_width=True)
+
 
 # ---------------- EXPORT ----------------
 elif menu == "Export":
@@ -498,36 +565,13 @@ elif menu == "Export":
 
     st.success("Export ready.")
 
+
 # ---------------- SETTINGS ----------------
 elif menu == "Settings":
     st.subheader("⚙️ Settings")
 
     balance = get_balance()
-    st.metric("Main Balance", f"{balance:,.2f} €")
-
-    st.divider()
-
-    st.subheader("📌 Timeline Settings")
-
-    starting_balance = float(get_setting("starting_balance") or 0)
-    starting_date_str = get_setting("starting_date") or str(date.today())
-
-    new_starting_balance = st.number_input(
-        "Starting balance (€)",
-        value=float(starting_balance),
-        step=100.0
-    )
-
-    new_starting_date = st.date_input(
-        "Starting date",
-        value=pd.to_datetime(starting_date_str)
-    )
-
-    if st.button("💾 Save Timeline Settings"):
-        set_setting("starting_balance", str(new_starting_balance))
-        set_setting("starting_date", str(new_starting_date))
-        st.success("Timeline settings saved!")
-        st.rerun()
+    st.metric("Main Balance (DB)", f"{balance:,.2f} €")
 
     st.divider()
 
