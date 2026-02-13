@@ -1,10 +1,12 @@
 import pandas as pd
 from datetime import date
 from sqlalchemy import text
+import streamlit as st
 from database import engine
 
 
 # ---------------- TRANSACTIONS ----------------
+@st.cache_data(ttl=20)
 def load_transactions():
     with engine.connect() as conn:
         df = pd.read_sql("SELECT * FROM transactions ORDER BY date ASC", conn)
@@ -12,6 +14,7 @@ def load_transactions():
 
 
 # ---------------- SNAPSHOTS ----------------
+@st.cache_data(ttl=20)
 def load_snapshots():
     with engine.connect() as conn:
         df = pd.read_sql("SELECT * FROM snapshots ORDER BY date ASC", conn)
@@ -88,6 +91,7 @@ def set_setting(key, value):
 
 
 # ---------------- NET WORTH TIMELINE ----------------
+@st.cache_data(ttl=20)
 def build_balance_timeline():
     starting_balance = float(get_setting("starting_balance") or 0)
     starting_date_str = get_setting("starting_date") or str(date.today())

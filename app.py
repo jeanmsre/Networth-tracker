@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import date
 import plotly.express as px
 from sqlalchemy import text
-from streamlit_cookies_manager import EncryptedCookieManager
+from streamlit_cookies_manager import CookieManager
 
 from database import init_db, engine
 from analytics import (
@@ -26,10 +26,7 @@ init_db()
 st.set_page_config(page_title="NetWorth Tracker", layout="wide")
 
 # ---------------- COOKIES (PERSISTENT LOGIN) ----------------
-cookies = EncryptedCookieManager(
-    prefix="networth_app",
-    password=os.getenv("APP_PASSWORD", "default_secret")
-)
+cookies = CookieManager()
 
 if not cookies.ready():
     st.stop()
@@ -37,16 +34,14 @@ if not cookies.ready():
 # ---------------- PASSWORD PROTECTION ----------------
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
-if APP_PASSWORD == "":
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+# Auto login from cookie
+if cookies.get("auth") == "1":
     st.session_state.authenticated = True
-else:
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
 
-    # Auto login from cookie
-    if cookies.get("auth") == "true":
-        st.session_state.authenticated = True
-
+if APP_PASSWORD != "":
     if not st.session_state.authenticated:
         st.title("🔒 Protected NetWorth Tracker")
 
@@ -55,7 +50,7 @@ else:
         if st.button("Login"):
             if password_input == APP_PASSWORD:
                 st.session_state.authenticated = True
-                cookies["auth"] = "true"
+                cookies["auth"] = "1"
                 cookies.save()
                 st.success("Welcome Sir 😈")
                 st.rerun()
@@ -79,12 +74,9 @@ menu = st.sidebar.radio("📌 Menu", [
 # Logout
 if st.sidebar.button("🚪 Logout"):
     st.session_state.authenticated = False
-    cookies["auth"] = "false"
+    cookies["auth"] = "0"
     cookies.save()
     st.rerun()
-
-# Always save snapshot for today
-save_snapshot()
 
 # Month mapping
 month_names = {
@@ -92,7 +84,6 @@ month_names = {
     5: "May", 6: "June", 7: "July", 8: "August",
     9: "September", 10: "October", 11: "November", 12: "December"
 }
-
 
 # ---------------- DASHBOARD ----------------
 if menu == "Dashboard":
@@ -218,14 +209,12 @@ if menu == "Dashboard":
 
     st.divider()
 
-    # ---------------- PREPARE DF ----------------
     if not transactions_df.empty:
         df_all = transactions_df.copy()
         df_all["date"] = pd.to_datetime(df_all["date"]).dt.date
     else:
         df_all = pd.DataFrame()
 
-    # ---------------- DEFINE PERIOD ----------------
     if display_mode == "Cumulative (Year)":
         start_date = date(selected_year, 1, 1)
         end_date = date(selected_year + 1, 1, 1)
@@ -241,45 +230,35 @@ if menu == "Dashboard":
     else:
         df_period = pd.DataFrame()
 
-    # ---------------- GRAPH INCOME/EXPENSE ----------------
     st.subheader("📈 Income / Expenses")
 
     if not df_all.empty:
         daily_summary = df_period.groupby(["date", "type"])["amount"].sum().reset_index()
-
         pivot = daily_summary.pivot(index="date", columns="type", values="amount").fillna(0)
 
         if "income" not in pivot.columns:
             pivot["income"] = 0
-
         if "expense" not in pivot.columns:
             pivot["expense"] = 0
 
         pivot = pivot.sort_index()
-
         merged = pivot.reset_index()[["date", "income", "expense"]]
 
-        # Fill missing days
         all_days = pd.date_range(start=start_date, end=end_date - pd.Timedelta(days=1), freq="D").date
         merged["date"] = pd.to_datetime(merged["date"]).dt.date
-
         merged = merged.set_index("date").reindex(all_days, fill_value=0).reset_index()
         merged = merged.rename(columns={"index": "date"})
 
-        # Apply cumulative mode
         if display_mode in ["Cumulative (Month)", "Cumulative (Year)"]:
             merged["income"] = merged["income"].cumsum()
             merged["expense"] = merged["expense"].cumsum()
 
-        # Add balance curve if requested
         if show_balance:
             timeline_df2 = build_balance_timeline()
             timeline_df2["date"] = pd.to_datetime(timeline_df2["date"]).dt.date
-
             merged = pd.merge(merged, timeline_df2, on="date", how="left")
-            merged["balance"] = merged["balance"].fillna(method="ffill").fillna(0)
+            merged["balance"] = merged["balance"].ffill().fillna(0)
 
-        # Title
         if display_mode == "Cumulative (Year)":
             title = f"{display_mode} - {selected_year}"
         else:
@@ -289,13 +268,7 @@ if menu == "Dashboard":
         if show_balance:
             y_cols.append("balance")
 
-        fig = px.line(
-            merged,
-            x="date",
-            y=y_cols,
-            markers=True,
-            title=title
-        )
+        fig = px.line(merged, x="date", y=y_cols, markers=True, title=title)
 
         fig.update_xaxes(type="category")
         fig.update_layout(
@@ -313,13 +286,11 @@ if menu == "Dashboard":
                 trace.line.color = "gray"
 
         st.plotly_chart(fig, use_container_width=True)
-
     else:
         st.info("No transactions yet.")
 
     st.divider()
 
-    # ---------------- TOTALS ----------------
     st.subheader("📌 Totals (Selected Period)")
 
     if not df_period.empty:
@@ -334,7 +305,6 @@ if menu == "Dashboard":
 
     st.divider()
 
-    # ---------------- PIE CHART CATEGORY (MONTH ONLY) ----------------
     st.subheader("🍕 Expenses by Category (Selected Month)")
 
     if display_mode != "Cumulative (Year)" and not df_period.empty:
@@ -349,7 +319,6 @@ if menu == "Dashboard":
                 values="amount",
                 title=f"Expenses ({month_names[selected_month]} {selected_year})"
             )
-
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
             st.info("No expenses for this month.")
@@ -358,12 +327,10 @@ if menu == "Dashboard":
 
     st.divider()
 
-    # ---------------- MONTHLY CASHFLOW ALL TIME ----------------
     st.subheader("📅 Monthly Income vs Expenses (All Time)")
 
     if not transactions_df.empty:
         monthly = monthly_summary(transactions_df)
-
         if not monthly.empty:
             fig_monthly = px.bar(
                 monthly,
@@ -422,6 +389,7 @@ elif menu == "Transactions":
             set_balance(balance)
             save_snapshot()
 
+            st.cache_data.clear()
             st.success(f"Transaction added! New balance: {balance:,.2f} €")
             st.rerun()
 
@@ -466,6 +434,7 @@ elif menu == "Transactions":
                     )
 
             save_snapshot()
+            st.cache_data.clear()
             st.success("Transaction deleted and balance corrected.")
             st.rerun()
 
@@ -502,6 +471,8 @@ elif menu == "Timeline":
         if submitted:
             set_setting("starting_balance", str(new_starting_balance))
             set_setting("starting_date", str(new_starting_date))
+
+            st.cache_data.clear()
             st.success("Starting point updated successfully!")
             st.rerun()
 
@@ -586,5 +557,7 @@ elif menu == "Settings":
     if st.button("💾 Update Main Balance"):
         set_balance(new_balance)
         save_snapshot()
+
+        st.cache_data.clear()
         st.success("Balance updated!")
         st.rerun()
